@@ -22,6 +22,8 @@ targets:
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        NSBonjourServices:
+          - _http._tcp
         NSLocalNetworkUsageDescription: Hop lets your PC send and receive files over your local network.
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -36,3 +38,4 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.hop.transfer
         TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
