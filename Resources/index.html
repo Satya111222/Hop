@@ -64,7 +64,7 @@ h2{font-size:13px;margin:26px 0 10px;color:var(--dim);font-weight:700}
 <div id="pinov"><div class="card"><b>Enter the PIN shown on the iPad</b><input id="pininput" inputmode="numeric" autocomplete="off" maxlength="8"></div></div>
 
 <script>
-const CHUNK = 4 * 1024 * 1024;
+const CHUNK = 16 * 1024 * 1024;
 const $ = s => document.querySelector(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let PIN = '';
@@ -119,10 +119,12 @@ const queue = []; let busy = false;
 function makeRow(f) {
   const el = document.createElement('div');
   el.className = 'card';
-  el.innerHTML = '<div class="row"><span class="tag" style="--c:var(--blue)">TO IPAD</span><span class="tag st" style="--c:var(--gray)">QUEUED</span><span class="grow"></span><b class="pct">0%</b></div>' +
+  el.innerHTML = '<div class="row"><span class="tag" style="--c:var(--blue)">TO IPAD</span><span class="tag st" style="--c:var(--gray)">QUEUED</span><span class="grow"></span><b class="pct">0%</b><button class="round cx" style="width:32px;height:32px;font-size:13px" title="Cancel">&#10005;</button></div>' +
     '<div class="name" style="margin-top:10px">' + esc(f.name) + '</div><div class="bar"><i></i></div><div class="info">' + fmtB(f.size) + '</div>';
   $('#queue').prepend(el);
-  return { el, f, t0: 0, lastT: 0, lastB: 0, speed: 0 };
+  const row = { el, f, t0: 0, lastT: 0, lastB: 0, speed: 0, cancelled: false, done: false, xhr: null };
+  el.querySelector('.cx').onclick = () => cancelRow(row);
+  return row;
 }
 
 function paint(row, bytes, state) {
@@ -138,7 +140,9 @@ function paint(row, bytes, state) {
   let info = fmtB(Math.min(bytes, f.size)) + ' / ' + fmtB(f.size);
   if (!state && row.speed > 1) info += '   ' + fmtB(row.speed) + '/s   ' + fmtT((f.size - bytes) / row.speed) + ' left';
   const st = row.el.querySelector('.st');
-  if (state === 'done') { st.textContent = 'DONE'; st.style.setProperty('--c', 'var(--green)'); row.el.querySelector('.bar i').classList.add('ok'); info = fmtB(f.size) + ' sent'; }
+  if (state === 'done' || state === 'fail' || state === 'cancel') row.el.querySelector('.cx').style.display = 'none';
+  if (state === 'cancel') { st.textContent = 'CANCELLED'; st.style.setProperty('--c', 'var(--gray)'); info = 'Cancelled'; }
+  else if (state === 'done') { st.textContent = 'DONE'; st.style.setProperty('--c', 'var(--green)'); row.el.querySelector('.bar i').classList.add('ok'); info = fmtB(f.size) + ' sent'; }
   else if (state === 'fail') { st.textContent = 'FAILED'; st.style.setProperty('--c', 'var(--red)'); }
   else if (state === 'retry') { st.textContent = 'RETRYING'; st.style.setProperty('--c', 'var(--orange)'); }
   else { st.textContent = 'LIVE'; st.style.setProperty('--c', 'var(--yellow)'); }
@@ -151,9 +155,11 @@ function fileId(f) {
   return 'u' + (h >>> 0).toString(36) + f.size.toString(36);
 }
 
-function xhrPut(url, blob, onprog) {
+function xhrPut(url, blob, onprog, row) {
   return new Promise((res, rej) => {
     const x = new XMLHttpRequest();
+    row.xhr = x;
+    x.onabort = () => rej(new Error('cancelled'));
     x.open('PUT', url);
     x.setRequestHeader('X-Pin', PIN);
     x.upload.onprogress = e => onprog(e.loaded);
@@ -172,12 +178,15 @@ async function sendChunk(f, id, off, row) {
   let tries = 0;
   for (;;) {
     try {
-      const x = await xhrPut(url, blob, loaded => paint(row, off + loaded));
+      if (row.cancelled) throw new Error('cancelled');
+      const x = await xhrPut(url, blob, loaded => paint(row, off + loaded), row);
+      if (x.status === 410) { row.cancelled = true; throw new Error('cancelled'); }
       if (x.status === 401) { await askPin(); continue; }
       if (x.status === 409) return JSON.parse(x.responseText).received; // server has less, resume from there
       if (x.status !== 200) throw new Error('server returned ' + x.status);
       return end;
     } catch (e) {
+      if (row.cancelled || e.message === 'cancelled') throw new Error('cancelled');
       if (++tries > 6) throw e;
       paint(row, off, 'retry');
       await sleep(Math.min(1000 * tries, 5000));
@@ -198,12 +207,23 @@ async function upload(row) {
   for (;;) {
     try {
       const r = await api('/api/upload/finish?' + qs({ id, name: f.name, total: f.size }), { method: 'POST' });
+      if (r.status === 410) { row.cancelled = true; throw new Error('cancelled'); }
       if (r.status === 401) { await askPin(); continue; }
       if (r.status !== 200) throw new Error('could not finish (' + r.status + ')');
       break;
     } catch (e) { if (++tries > 4) throw e; await sleep(1000); }
   }
+  row.done = true;
   paint(row, f.size, 'done');
+}
+
+function cancelRow(row) {
+  if (row.done || row.cancelled) return;
+  row.cancelled = true;
+  const i = queue.indexOf(row);
+  if (i >= 0) { queue.splice(i, 1); paint(row, 0, 'cancel'); return; }
+  if (row.xhr) row.xhr.abort();
+  api('/api/upload/cancel?' + qs({ id: fileId(row.f) }), { method: 'POST' }).catch(() => {});
 }
 
 async function pump() {
@@ -211,7 +231,10 @@ async function pump() {
   while (queue.length) {
     const row = queue.shift();
     try { await upload(row); }
-    catch (e) { paint(row, 0, 'fail'); row.el.querySelector('.info').textContent = e.message + ' (drop the file again to resume)'; }
+    catch (e) {
+      if (e.message === 'cancelled') paint(row, 0, 'cancel');
+      else { paint(row, 0, 'fail'); row.el.querySelector('.info').textContent = e.message + ' (drop the file again to resume)'; }
+    }
   }
   busy = false; loadFiles();
 }
