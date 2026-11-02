@@ -116,6 +116,8 @@ final class HTTPServer {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
         let l = try NWListener(using: params, on: p)
+        // Advertising a Bonjour service is what makes iOS show the Local Network permission prompt.
+        l.service = NWListener.Service(name: "Hop", type: "_http._tcp")
         l.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready: self?.onState?(true, nil)
