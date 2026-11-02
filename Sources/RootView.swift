@@ -19,6 +19,7 @@ enum Screen: CaseIterable {
 }
 
 struct RootView: View {
+    @EnvironmentObject var core: Core
     @State private var tab: Screen = .home
     @Namespace private var ns
 
@@ -37,6 +38,20 @@ struct RootView: View {
             .transition(.opacity)
             FloatingNav(tab: $tab, ns: ns).padding(.bottom, 10)
         }
+        .overlay(alignment: .top) {
+            if let msg = core.toast {
+                Text(msg)
+                    .font(mono(12, .bold))
+                    .foregroundColor(T.fg)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .overlay(Capsule().stroke(T.line, lineWidth: 1))
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: core.toast)
         .animation(.easeInOut(duration: 0.2), value: tab)
     }
 }

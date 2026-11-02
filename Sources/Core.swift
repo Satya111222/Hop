@@ -3,7 +3,7 @@ import UIKit
 import Network
 
 enum Dir { case up, down }
-enum TState { case live, done, failed }
+enum TState { case live, done, failed, cancelled }
 
 struct Transfer: Identifiable {
     let id: String
@@ -32,6 +32,7 @@ final class Core: ObservableObject {
     @Published var running = false
     @Published var address = "not running"
     @Published var error: String?
+    @Published var toast: String?
     @Published var transfers: [Transfer] = []
     @Published var files: [FileItem] = []
     @Published var pinEnabled = UserDefaults.standard.bool(forKey: "pinEnabled") {
@@ -49,6 +50,8 @@ final class Core: ObservableObject {
     private let lock = NSLock()
     private var pinSnapshot: String?
     private var lastUI: [String: Date] = [:]   // server queue only
+    private var cancelledUploads = Set<String>()          // server queue only
+    private var downloads: [String: HTTPResponder] = [:]  // server queue only
 
     init() {
         try? FileManager.default.createDirectory(at: parts, withIntermediateDirectories: true)
@@ -157,12 +160,25 @@ final class Core: ObservableObject {
 
     func importFiles(_ urls: [URL]) {
         DispatchQueue.global(qos: .userInitiated).async {
+            var n = 0
             for u in urls {
                 let scoped = u.startAccessingSecurityScopedResource()
                 defer { if scoped { u.stopAccessingSecurityScopedResource() } }
-                try? FileManager.default.copyItem(at: u, to: self.uniqueURL(u.lastPathComponent))
+                let dest = self.uniqueURL(u.lastPathComponent)
+                if (try? FileManager.default.moveItem(at: u, to: dest)) != nil { n += 1 }
+                else if (try? FileManager.default.copyItem(at: u, to: dest)) != nil { n += 1 }
             }
-            DispatchQueue.main.async { self.refreshFiles() }
+            DispatchQueue.main.async {
+                self.refreshFiles()
+                self.say(n == 1 ? "Added 1 file. Download it from the PC page." : "Added \(n) files. Download them from the PC page.")
+            }
+        }
+    }
+
+    func say(_ s: String) {
+        toast = s
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            if self?.toast == s { self?.toast = nil }
         }
     }
 
@@ -196,6 +212,31 @@ final class Core: ObservableObject {
 
     func clearFinished() { transfers.removeAll { $0.state != .live } }
 
+    /// Cancel button on the iPad.
+    func cancel(_ id: String) {
+        if let i = transfers.firstIndex(where: { $0.id == id }) {
+            transfers[i].state = .cancelled
+            transfers[i].speed = 0
+        }
+        server.queue.async { [weak self] in
+            guard let self = self else { return }
+            if let r = self.downloads[id] {
+                r.cancel()
+                self.downloads[id] = nil
+            } else {
+                self.cancelledUploads.insert(id)
+                try? FileManager.default.removeItem(at: self.parts.appendingPathComponent(id + ".part"))
+            }
+        }
+    }
+
+    /// A cancelled upload that starts again (same file) should show up as live again.
+    private func revive(_ id: String) {
+        if let i = transfers.firstIndex(where: { $0.id == id }), transfers[i].state == .cancelled {
+            transfers[i].state = .failed
+        }
+    }
+
     private func sweep() {
         let now = Date()
         for i in transfers.indices where transfers[i].state == .live && now.timeIntervalSince(transfers[i].lastSeen) > 25 {
@@ -219,6 +260,11 @@ final class Core: ObservableObject {
     }
 
     private func apply(_ id: String, _ name: String, _ dir: Dir, _ total: Int64, _ done: Int64, _ state: TState) {
+        if state == .cancelled {
+            if let i = transfers.firstIndex(where: { $0.id == id }) { transfers[i].state = .cancelled; transfers[i].speed = 0 }
+            return
+        }
+        if let i = transfers.firstIndex(where: { $0.id == id }), transfers[i].state == .cancelled { return }
         let now = Date()
         if let i = transfers.firstIndex(where: { $0.id == id }) {
             var t = transfers[i]
@@ -283,9 +329,17 @@ final class Core: ObservableObject {
             res.json(list)
         case ("GET", "/api/upload/status"):
             guard let id = safeID(req.query["id"]) else { res.json(["error": "bad id"], status: 400); return }
+            cancelledUploads.remove(id)
+            DispatchQueue.main.async { self.revive(id) }
             res.json(["received": fileSize(parts.appendingPathComponent(id + ".part"))])
         case ("PUT", "/api/upload"):
             uploadChunk(req, res)
+        case ("POST", "/api/upload/cancel"):
+            guard let id = safeID(req.query["id"]) else { res.json(["error": "bad id"], status: 400); return }
+            cancelledUploads.insert(id)
+            try? FileManager.default.removeItem(at: parts.appendingPathComponent(id + ".part"))
+            report(id, "", .up, total: 0, done: 0, .cancelled)
+            res.json(["ok": true])
         case ("POST", "/api/upload/finish"):
             uploadFinish(req, res)
         case ("DELETE", "/api/files"):
@@ -302,6 +356,7 @@ final class Core: ObservableObject {
         guard let id = safeID(req.query["id"]), let name = safeName(req.query["name"]),
               let offset = Int64(req.query["offset"] ?? ""), let total = Int64(req.query["total"] ?? ""),
               offset >= 0 else { res.json(["error": "bad params"], status: 400); return }
+        if cancelledUploads.contains(id) { res.json(["error": "cancelled"], status: 410); return }
         let part = parts.appendingPathComponent(id + ".part")
         let fm = FileManager.default
         if !fm.fileExists(atPath: part.path) { fm.createFile(atPath: part.path, contents: nil) }
@@ -325,6 +380,7 @@ final class Core: ObservableObject {
     private func uploadFinish(_ req: HTTPRequest, _ res: HTTPResponder) {
         guard let id = safeID(req.query["id"]), let name = safeName(req.query["name"]),
               let total = Int64(req.query["total"] ?? "") else { res.json(["error": "bad params"], status: 400); return }
+        if cancelledUploads.contains(id) { res.json(["error": "cancelled"], status: 410); return }
         let part = parts.appendingPathComponent(id + ".part")
         let fm = FileManager.default
         if !fm.fileExists(atPath: part.path) {
@@ -384,6 +440,7 @@ final class Core: ObservableObject {
         let length = end - start + 1
         let id = UUID().uuidString
         var last: Int64 = 0
+        downloads[id] = res
         report(id, name, .down, total: length, done: 0, .live)
         res.streamFile(url: url, start: start, length: length, total: total, partial: partial, filename: name,
                        progress: { [weak self] sent in
@@ -391,6 +448,7 @@ final class Core: ObservableObject {
                            self?.report(id, name, .down, total: length, done: sent, .live)
                        },
                        finished: { [weak self] ok in
+                           self?.downloads[id] = nil
                            self?.report(id, name, .down, total: length, done: ok ? length : last, ok ? .done : .failed)
                        })
     }

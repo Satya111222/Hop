@@ -36,6 +36,7 @@ struct TransfersView: View {
 }
 
 struct TransferRow: View {
+    @EnvironmentObject var core: Core
     let t: Transfer
 
     private var fraction: Double { t.total > 0 ? Double(t.done) / Double(t.total) : (t.state == .done ? 1 : 0) }
@@ -45,6 +46,15 @@ struct TransferRow: View {
         case .live: return ("LIVE", .yellow)
         case .done: return ("DONE", .green)
         case .failed: return ("FAILED", T.red)
+        case .cancelled: return ("CANCELLED", .gray)
+        }
+    }
+
+    private var barColor: Color {
+        switch t.state {
+        case .done: return .green
+        case .cancelled: return .gray
+        default: return T.red
         }
     }
 
@@ -64,13 +74,17 @@ struct TransferRow: View {
                 Tag(text: stateTag.0, color: stateTag.1)
                 Spacer()
                 Text("\(Int(fraction * 100))%").font(mono(13, .bold)).foregroundColor(T.fg)
+                if t.state == .live {
+                    Button { withAnimation { core.cancel(t.id) } } label: { RoundIcon(name: "xmark", size: 32) }
+                        .buttonStyle(.plain)
+                }
             }
             Text(t.name)
                 .font(mono(14, .bold))
                 .foregroundColor(T.fg)
                 .lineLimit(1)
                 .truncationMode(.middle)
-            ProgressLine(value: fraction, color: t.state == .failed ? T.red : (t.state == .done ? .green : T.red))
+            ProgressLine(value: fraction, color: barColor)
             Text(info).font(mono(11)).foregroundColor(T.dim)
         }
     }

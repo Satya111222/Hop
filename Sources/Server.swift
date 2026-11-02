@@ -12,7 +12,14 @@ struct HTTPRequest {
 /// Writes one response on one connection, then closes it.
 final class HTTPResponder {
     private let conn: NWConnection
+    private(set) var isCancelled = false
     init(_ conn: NWConnection) { self.conn = conn }
+
+    /// Stops an in-progress response (used for the Cancel button).
+    func cancel() {
+        isCancelled = true
+        conn.cancel()
+    }
 
     static func reason(_ s: Int) -> String {
         switch s {
@@ -23,6 +30,7 @@ final class HTTPResponder {
         case 401: return "Unauthorized"
         case 404: return "Not Found"
         case 409: return "Conflict"
+        case 410: return "Gone"
         case 413: return "Payload Too Large"
         case 416: return "Range Not Satisfiable"
         case 500: return "Internal Server Error"
@@ -70,6 +78,7 @@ final class HTTPResponder {
 
     private func pump(_ fh: FileHandle, remaining: Int64, sent: Int64,
                       progress: @escaping (Int64) -> Void, finished: @escaping (Bool) -> Void) {
+        if isCancelled { try? fh.close(); conn.cancel(); finished(false); return }
         if remaining <= 0 {
             try? fh.close()
             conn.send(content: nil, contentContext: .finalMessage, isComplete: true,
@@ -77,7 +86,7 @@ final class HTTPResponder {
             finished(true)
             return
         }
-        let n = Int(min(remaining, 512 * 1024))
+        let n = Int(min(remaining, 1024 * 1024))
         guard let chunk = try? fh.read(upToCount: n), !chunk.isEmpty else {
             try? fh.close(); conn.cancel(); finished(false); return
         }
@@ -89,6 +98,11 @@ final class HTTPResponder {
             self.pump(fh, remaining: remaining - Int64(chunk.count), sent: s, progress: progress, finished: finished)
         })
     }
+}
+
+final class BodyBuffer {
+    var data: Data
+    init(_ d: Data) { data = d }
 }
 
 /// Minimal HTTP/1.1 server on Network.framework. One request per connection.
@@ -113,7 +127,9 @@ final class HTTPServer {
     func start(port: UInt16) throws {
         stop()
         guard let p = NWEndpoint.Port(rawValue: port) else { return }
-        let params = NWParameters.tcp
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let params = NWParameters(tls: nil, tcp: tcp)
         params.allowLocalEndpointReuse = true
         let l = try NWListener(using: params, on: p)
         // Advertising a Bonjour service is what makes iOS show the Local Network permission prompt.
@@ -153,7 +169,8 @@ final class HTTPServer {
                       let head = Self.parseHead(headStr) else { res.send(400); return }
                 let length = Int(head.headers["content-length"] ?? "") ?? 0
                 if length > self.maxBody { res.send(413); return }
-                let body = buf.subdata(in: r.upperBound..<buf.count)
+                let body = BodyBuffer(buf.subdata(in: r.upperBound..<buf.count))
+                if length > body.data.count { body.data.reserveCapacity(length) }
                 self.receiveBody(conn, res, head, body, length)
             } else if isComplete || buf.count > 64 * 1024 {
                 conn.cancel()
@@ -163,18 +180,17 @@ final class HTTPServer {
         }
     }
 
-    private func receiveBody(_ conn: NWConnection, _ res: HTTPResponder, _ head: Head, _ body: Data, _ length: Int) {
-        if body.count >= length {
-            dispatch(head, Data(body.prefix(length)), res)
+    private func receiveBody(_ conn: NWConnection, _ res: HTTPResponder, _ head: Head, _ buf: BodyBuffer, _ length: Int) {
+        if buf.data.count >= length {
+            dispatch(head, buf.data.count == length ? buf.data : Data(buf.data.prefix(length)), res)
             return
         }
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] data, _, isComplete, error in
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 4 << 20) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
             if error != nil { conn.cancel(); return }
-            var b = body
-            if let d = data { b.append(d) }
-            if isComplete && b.count < length { conn.cancel(); return }
-            self.receiveBody(conn, res, head, b, length)
+            if let d = data { buf.data.append(d) }
+            if isComplete && buf.data.count < length { conn.cancel(); return }
+            self.receiveBody(conn, res, head, buf, length)
         }
     }
 

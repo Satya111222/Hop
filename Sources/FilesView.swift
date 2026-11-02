@@ -1,22 +1,23 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct FilesView: View {
     @EnvironmentObject var core: Core
-    @State private var importing = false
 
     var body: some View {
         ScrollView {
             VStack(spacing: 12) {
                 Header(title: "files", subtitle: "\(core.files.count) on this iPad") {
-                    Button { importing = true } label: { RoundIcon(name: "plus", filled: true) }
+                    Button { DocPicker.present { urls in core.importFiles(urls) } } label: {
+                        RoundIcon(name: "plus", filled: true)
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding(.bottom, 4)
 
                 if core.files.isEmpty {
                     Card {
                         Text("Nothing here yet").font(mono(14, .bold)).foregroundColor(T.fg)
-                        Text("Files sent from your PC land here. Tap + to add files from this iPad so your PC can download them.")
+                        Text("Files sent from your PC land here. Tap + to add files from this iPad, then download them from the PC page with the red arrow.")
                             .font(mono(12)).foregroundColor(T.dim)
                     }
                 }
@@ -31,9 +32,6 @@ struct FilesView: View {
             .animation(.easeInOut(duration: 0.2), value: core.files.map(\.id))
         }
         .onAppear { core.refreshFiles() }
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
-            if case .success(let urls) = result { core.importFiles(urls) }
-        }
     }
 }
 
@@ -62,6 +60,7 @@ struct FileRow: View {
                 Spacer(minLength: 4)
                 ShareLink(item: f.url) { RoundIcon(name: "square.and.arrow.up", size: 36) }
                 Button { withAnimation { core.delete(f) } } label: { RoundIcon(name: "trash", size: 36) }
+                    .buttonStyle(.plain)
             }
         }
     }
